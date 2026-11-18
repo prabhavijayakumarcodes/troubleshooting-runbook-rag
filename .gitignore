@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+faiss_index_runbook/
+.env
+.DS_Store
