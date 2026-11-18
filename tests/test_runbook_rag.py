@@ -139,3 +139,22 @@ def test_chain_passes_retrieved_context_to_the_llm(store):
     assert "[p.4 | ERR-504 - Gateway timeout]" in captured["prompt"]
     assert rr.NOT_FOUND_MSG in captured["prompt"]
     assert "p.4 | ERR-504 - Gateway timeout | error-code match" in rr.format_sources(out["hits"])
+
+
+def test_embedding_wrapper_caches_and_retries_on_quota_errors(monkeypatch):
+    calls = {"n": 0, "texts": 0}
+
+    class Flaky(BagOfWordsEmbeddings):
+        def embed_documents(self, texts):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("429 Resource has been exhausted (e.g. check quota).")
+            calls["texts"] += len(texts)
+            return super().embed_documents(texts)
+
+    monkeypatch.setattr(rr.time, "sleep", lambda s: None)
+    emb = rr.CachedRateLimitedEmbeddings(Flaky(), batch_size=2)
+    first = emb.embed_documents(["a", "b", "c", "a"])
+    again = emb.embed_documents(["c", "b"])
+    assert first[0] == first[3] and again == [first[2], first[1]]
+    assert calls["texts"] == 3  # each distinct text embedded once, despite the retry and the repeat call

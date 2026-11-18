@@ -15,7 +15,7 @@ $ python ask.py "Pod event: Reason: OOMKilled, Exit Code: 137 on reporting-engin
 | [`Runbook_RAG_Assistant.ipynb`](Runbook_RAG_Assistant.ipynb) | Step-by-step walkthrough: loading, cleaning, chunking experiment, embeddings, FAISS, hybrid retrieval, grounded prompt, demos and evaluation |
 | [`runbook_rag.py`](runbook_rag.py) | Reusable pipeline used by the notebook, the CLI and the tests |
 | [`ask.py`](ask.py) | Command-line assistant (one-shot or interactive) |
-| [`tests/`](tests) | 18 offline unit tests (no API key needed) |
+| [`tests/`](tests) | 19 offline unit tests (no API key needed) |
 | `data/troubleshooting_runbook.pdf` | The only knowledge source |
 
 ## How it works
@@ -34,6 +34,28 @@ $ python ask.py "Pod event: Reason: OOMKilled, Exit Code: 137 on reporting-engin
 7. **Evaluation.**
    - **Retrieval:** hit rate and MRR on 20 questions with known answers. The notebook compares page-based chunking at 300, 500, 800 and 1,200 characters, section-aware chunking, and section-aware chunking with hybrid retrieval.
    - **Answers:** checks that answers contain the expected facts and a page citation, that partly covered questions are flagged, and that out-of-scope questions are refused.
+
+## Results
+
+From the executed notebook (`models/gemini-embedding-001` + `gemini-3.5-flash-lite`, top-4 retrieval):
+
+| Chunking / retrieval | Chunks | Hit rate@4 | MRR |
+|---|---|---|---|
+| Page-based, 300 / 50 | 70 | 0.85 | 0.63 |
+| Page-based, 500 / 50 | 39 | 0.90 | 0.67 |
+| Page-based, 800 / 100 | 26 | 0.95 | 0.83 |
+| Page-based, 1,200 / 150 | 19 | 1.00 | 0.78 |
+| **Section-aware** | 23 | **1.00** | **0.95** |
+| **Section-aware + hybrid** | 23 | **1.00** | **0.95** |
+
+Section-aware chunking finds every answer and ranks the right section first for 18 of the 20 questions. Page-based chunks of 1,200 characters also find every answer, but rank the right chunk lower (MRR 0.78) and send more text to the LLM.
+
+On this evaluation set, hybrid retrieval scores the same as semantic search alone. Its value is as a safety net: the code's section is always returned when the alert names it.
+
+**Answer evaluation: 10 / 10 passed.**
+- 6 in-scope questions answered with the correct facts and page citations.
+- 1 question the runbook covers only partly was flagged as not covered.
+- 3 out-of-scope questions were refused with the fixed message.
 
 ## How to run
 
@@ -73,7 +95,9 @@ python ask.py --semantic-only ...  # compare against pure semantic retrieval
 pytest -q tests
 ```
 
-To use different models, set `RUNBOOK_EMBEDDING_MODEL` or `RUNBOOK_LLM_MODEL`; no code change is needed.
+To use different models, set `RUNBOOK_EMBEDDING_MODEL` or `RUNBOOK_LLM_MODEL`; no code change is needed. The default chat model is `gemini-3.5-flash-lite`. `gemini-2.5-flash` is no longer offered to new API keys, and the full 3.x flash models timed out with a free-tier key.
+
+The free tier allows 100 embedded texts per minute. To stay under that limit, embeddings are cached (each text is embedded once) and throttled with retry, and chat calls are rate-limited. A full notebook run takes about 5 minutes.
 
 ## Inconsistencies found in the runbook
 

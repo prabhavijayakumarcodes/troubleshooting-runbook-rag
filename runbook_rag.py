@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence
@@ -20,6 +21,7 @@ from typing import Callable, Iterable, List, Optional, Sequence
 import pdfplumber
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
@@ -33,7 +35,9 @@ INDEX_DIR = Path(__file__).parent / "faiss_index_runbook"
 
 # Model names can be overridden without touching code (Google renames / retires models).
 EMBEDDING_MODEL = os.environ.get("RUNBOOK_EMBEDDING_MODEL", "models/gemini-embedding-001")
-LLM_MODEL = os.environ.get("RUNBOOK_LLM_MODEL", "gemini-2.5-flash")
+# gemini-2.5-flash is no longer offered to new API keys; the 3.x full flash models timed out on a
+# free-tier key in testing, while flash-lite answered in ~1-2 s.
+LLM_MODEL = os.environ.get("RUNBOOK_LLM_MODEL", "gemini-3.5-flash-lite")
 
 SECTION_CHUNK_SIZE = 1600  # large enough to keep every runbook section / error code in one chunk
 SECTION_CHUNK_OVERLAP = 150
@@ -231,18 +235,66 @@ def ensure_api_key() -> None:
             os.environ["GOOGLE_API_KEY"] = getpass.getpass("Enter your Gemini API key: ")
 
 
+class CachedRateLimitedEmbeddings(Embeddings):
+    """Wraps an embedding model so it fits the Gemini free tier (100 embedded texts per minute):
+    - every distinct text is embedded once and cached (the experiments re-use the same chunks/questions);
+    - requests are sent in small batches and throttled to `per_minute` texts per rolling minute;
+    - a 429 / quota error waits and retries instead of failing the whole notebook."""
+
+    def __init__(self, inner: Embeddings, per_minute: int = 90, batch_size: int = 20, max_retries: int = 6):
+        self.inner, self.per_minute, self.batch_size, self.max_retries = inner, per_minute, batch_size, max_retries
+        self._cache: dict = {}
+        self._sent: List[tuple] = []  # (timestamp, n_texts) in the last minute
+
+    def _throttle(self, n: int) -> None:
+        while True:
+            now = time.time()
+            self._sent = [(t, k) for t, k in self._sent if now - t < 60]
+            if sum(k for _, k in self._sent) + n <= self.per_minute:
+                self._sent.append((now, n))
+                return
+            time.sleep(max(0.5, 60 - (now - self._sent[0][0])))
+
+    def _call(self, fn, arg, n: int):
+        for attempt in range(self.max_retries):
+            self._throttle(n)
+            try:
+                return fn(arg)
+            except Exception as exc:  # quota errors surface as different exception types across versions
+                if "429" not in str(exc) and "quota" not in str(exc).lower() and "exhausted" not in str(exc).lower():
+                    raise
+                time.sleep(20 * (attempt + 1))
+        return fn(arg)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        missing = list(dict.fromkeys(t for t in texts if ("d", t) not in self._cache))
+        for i in range(0, len(missing), self.batch_size):
+            batch = missing[i:i + self.batch_size]
+            for text, vec in zip(batch, self._call(self.inner.embed_documents, batch, len(batch))):
+                self._cache[("d", text)] = vec
+        return [self._cache[("d", t)] for t in texts]
+
+    def embed_query(self, text: str) -> List[float]:
+        if ("q", text) not in self._cache:
+            self._cache[("q", text)] = self._call(self.inner.embed_query, text, 1)
+        return self._cache[("q", text)]
+
+
 def make_embeddings():
     from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
     ensure_api_key()
-    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+    return CachedRateLimitedEmbeddings(GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL))
 
 
 def make_llm(temperature: float = 0.0):
+    from langchain_core.rate_limiters import InMemoryRateLimiter
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     ensure_api_key()
-    return ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=temperature)
+    # ~12 requests/minute keeps the free tier from returning 429s during the demo and evaluation cells.
+    limiter = InMemoryRateLimiter(requests_per_second=0.2, check_every_n_seconds=0.2, max_bucket_size=1)
+    return ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=temperature, rate_limiter=limiter, max_retries=6)
 
 
 def build_vector_store(chunks: List[Document], embeddings):
